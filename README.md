@@ -80,7 +80,8 @@ estado por HTTP a la red local. Es **solo lectura**: los arreglos no se pueden e
 - **Token:** en `~/.config/deckdoctor/api.json` (permisos 600). Se envía como `Authorization: Bearer <token>` o
   `?token=<token>`. Para cambiarlo, vaciar `"token"` y reiniciar el servicio: se genera uno nuevo.
 - **Configuración** (`api.json`): `port` (9555), `bind` (`0.0.0.0`), `interval` (300 s entre comprobaciones),
-  `slow_interval` (21600 s para SteamOS y Flatpak, que consultan internet), `token`.
+  `slow_interval` (21600 s para SteamOS y Flatpak, que consultan internet), `games_interval` (3600 s entre análisis
+  completos de los juegos), `token`.
   Después de cambiarla: `systemctl --user restart deckdoctor-api`.
 - Las comprobaciones se hacen en segundo plano y se guardan, así que consultar a menudo no carga la Deck.
   Con la Deck suspendida o apagada no responde: el dashboard debe tratarlo como «sin datos».
@@ -91,11 +92,25 @@ estado por HTTP a la red local. Es **solo lectura**: los arreglos no se pueden e
 | `GET /api/health` | Sí | Todo: `host`, `checked_at`, `summary` (`status` = peor estado y `counts`), `metrics` (plano) y `checks` (id, grupo, título, estado, detalle, nombre del arreglo y métricas de cada punto) |
 | `GET /api/metrics` | Sí | Solo `checked_at`, `status` y `metrics` planas, por ejemplo `{"battery_charge_percent": 97, "temperature_celsius": {"apu": 54, …}, "disk_free_bytes": {"ssd": …, "sd": …}}` |
 | `GET /metrics` | Sí | Formato Prometheus, con prefijo `deckdoctor_` |
-| `POST /api/refresh` | Sí | Repite todas las comprobaciones ahora, incluidas las lentas (202) |
+| `GET /api/games` | Sí | Juegos instalados (necesita [DeckSpace](https://github.com/drarekx/DeckSpace); sin ella, `{"available": false}`). Ver abajo |
+| `POST /api/refresh` | Sí | Repite todas las comprobaciones ahora, incluidas las lentas y el análisis de juegos (202) |
 
 Los `id` de las comprobaciones son estables: `ssh`, `ssh_password`, `password`, `path`, `keyboard`, `nsl`, `decky`, `failed`
 (o `failed_system`/`failed_user`), `steamos`, `uptime`, `battery`, `temps`, `disk_ssd`, `disk_sd`, `flatpak`,
 `journal`, `backups`, `trash`, `shaders` y `api`. Estados: `ok`, `info`, `warn` y `bad`.
+
+**Juegos (`/api/games`):** la API importa `deckspace.py` (de `~/Apps/DeckSpace` o de una carpeta `DeckSpace` junto a
+DeckDoctor) y reutiliza su lectura de Steam, sin duplicar código:
+- La **lista** (`installed_games()` y `shortcuts()`: `appmanifest_*.acf` y `shortcuts.vdf`, solo lectura) se lee en
+  cada comprobación, así que un juego instalado o borrado aparece en 5 minutos.
+- Los **tamaños completos** (`analyze()`: datos de Proton y caché de shaders medidos con `du`, y el espacio
+  recuperable) se calculan en un hilo aparte cada `games_interval`, con prioridad baja (`nice` 10) para no frenar la
+  Deck. Hasta el primer análisis, `proton_bytes` y `shader_bytes` valen `null`.
+- Respuesta: `listed_at`, `sized_at`, `summary` (`games`, `tools` = Proton y runtimes, `non_steam`, `bytes_by_drive`,
+  `total_bytes`, `unplayed_6m`, `recoverable_bytes`), `games` (por juego: `appid`, `name`, `drive`, `tool`, `installed`,
+  `last_played`, `game_bytes`, `proton_bytes`, `shader_bytes`, `total_bytes`; de mayor a menor) y `non_steam`
+  (`appid`, `name`).
+- En las métricas y en Prometheus solo van los totales (una serie por juego sería demasiado para Prometheus).
 
 **Métricas:**
 - `check_status{id,group,title}` (0 ok, 1 info, 2 aviso, 3 problema) y `checks{status}`.
@@ -107,6 +122,8 @@ Los `id` de las comprobaciones son estables: `ssh`, `ssh_password`, `password`, 
   `steamos_update_available` y `flatpak_updates`.
 - `uptime_seconds`, `journal_bytes`, `backups_bytes`, `backups_oldest_days`, `trash_bytes`, `shadercache_bytes` y
   `api_active`.
+- Con DeckSpace: `games_installed{kind=steam|tool|non_steam}`, `games_bytes{drive}`, `games_unplayed_6m`,
+  `games_recoverable_bytes` y `games_sized_timestamp_seconds`.
 - `last_check_timestamp_seconds`, `last_slow_check_timestamp_seconds` y `check_duration_seconds`.
 
 Ejemplo de configuración para Prometheus:
@@ -175,10 +192,13 @@ Ejemplo con curl: `curl -H "Authorization: Bearer <token>" http://<ip-de-la-deck
 - La API es de solo lectura (más `POST /api/refresh`, que no cambia nada): ejecutar arreglos remotos abriría otra
   puerta de entrada, como la del SSH. El token se compara con `hmac.compare_digest`. Lleva CORS abierto (`*`) para
   que un dashboard web pueda consultarla directamente; protege el token.
+- Los juegos se leen con el código de DeckSpace (importado como módulo opcional) en lugar de copiarlo: un único sitio
+  que mantener. Por eso los campos que devuelven `installed_games()`, `shortcuts()` y `analyze()` deben mantenerse.
 - Se exponen JSON y Prometheus a la vez: sirve tanto para un dashboard propio como para Grafana.
 
 ## Ideas pendientes
 - Plugin de Decky con el resumen en modo juego, usando la API local (`/api/health`).
+- Tamaño de los juegos no de Steam (sus datos de Proton) en `/api/games`.
 - Comprobar al arrancar y avisar con una notificación si algo está en rojo (servicio de usuario o autostart).
 - Guardar y restaurar `.bashrc`, `kxkbrc` y otros ajustes de usuario.
 - Salud SMART del SSD (necesita root).
