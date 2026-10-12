@@ -4,6 +4,10 @@ Chequeo de **salud de la Steam Deck**. Revisa seguridad, personalizaciones que u
 SteamOS podría deshacer, servicios, hardware y mantenimiento. Muestra cada punto con un semáforo y,
 cuando hay un arreglo seguro, un botón para aplicarlo.
 
+Además tiene una **[API de estadísticas](#api-para-dashboards)** opcional: publica en la red local el estado de la
+Deck (batería, temperaturas, espacio, juegos instalados…) en JSON y en formato Prometheus, para verlo en un
+dashboard propio o en Grafana.
+
 | Seguridad, personalizaciones y sistema | Hardware, mantenimiento e integraciones |
 |---|---|
 | ![Comprobaciones con semáforo y botones de arreglo](docs/comprobaciones.png) | ![Batería, temperaturas, espacio y API](docs/mantenimiento.png) |
@@ -74,6 +78,39 @@ Sin `git`, descarga el `.tar.gz` de la última versión en
 Servicio de usuario de systemd (`deckdoctor-api.service`) que arranca con la Deck, también en modo juego. Expone el
 estado por HTTP a la red local. Es **solo lectura**: los arreglos no se pueden ejecutar desde fuera.
 
+### Inicio rápido
+1. Abre DeckDoctor y, en «Integraciones», pulsa **Activar API**. Desde ese momento arranca sola con la Deck.
+2. En la misma tarjeta aparecen las direcciones (`http://<IP de la Deck>:9555`).
+3. Saca el token en una terminal de la Deck:
+   ```bash
+   python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/deckdoctor/api.json')))['token'])"
+   ```
+4. Prueba desde otro equipo de la red:
+   ```bash
+   curl http://<IP de la Deck>:9555/api/ping                                   # sin token: ¿está encendida?
+   curl -H "Authorization: Bearer <token>" http://<IP de la Deck>:9555/api/health
+   ```
+5. Para desactivarla: botón **Desactivar API** en la misma tarjeta.
+
+### De dónde salen los datos
+Todo se lee de la propia Deck, sin servicios externos. La API ejecuta las mismas comprobaciones que la ventana cada
+`interval` segundos y guarda el resultado; cada petición solo devuelve lo último guardado.
+
+| Dato | Fuente |
+|------|--------|
+| Batería (carga, salud, ciclos, enchufada) | `/sys/class/power_supply/BAT1` |
+| Temperaturas (APU, SSD, placa, Deck) | Sensores del kernel en `/sys/class/hwmon/` |
+| Espacio libre del SSD y la microSD | `shutil.disk_usage` |
+| Tiempo encendida | `/proc/uptime` |
+| SSH (activo, contraseña, claves) | `systemctl` y `/etc/ssh/sshd_config*` |
+| Servicios fallidos | `systemctl --failed` |
+| Decky Loader y sus plugins | `~/homebrew` y el servicio `plugin_loader` |
+| Registros, copias, papelera, caché de shaders | `journalctl --disk-usage` y el tamaño de esas carpetas |
+| Actualizaciones de SteamOS y Flatpak | `steamos-update check` y `flatpak remote-ls --updates` (consultan internet: cada `slow_interval`) |
+| Juegos instalados y su tamaño | DeckSpace: `appmanifest_*.acf`, `shortcuts.vdf` y `du` (ver «Juegos» más abajo) |
+
+### Referencia
+
 - **Dirección:** `http://<IP de la Deck>:9555`. DeckDoctor muestra las IP que tiene en ese momento (cable y Wi-Fi).
   Conviene reservarlas en el router para que no cambien; si la Deck usa a veces cable y a veces Wi-Fi, el
   dashboard puede probar las dos.
@@ -136,6 +173,53 @@ scrape_configs:
 ```
 
 Ejemplo con curl: `curl -H "Authorization: Bearer <token>" http://<ip-de-la-deck>:9555/api/metrics`
+
+### Ejemplos de respuesta
+`GET /api/health` (recortado a una comprobación):
+```json
+{
+  "host": "steamdeck",
+  "version": "1.0",
+  "checked_at": 1791801971.45,
+  "summary": {"status": "ok", "counts": {"ok": 21, "info": 0, "warn": 0, "bad": 0}},
+  "metrics": {"battery_charge_percent": 97.0, "temperature_celsius": {"apu": 61, "ssd": 73}, "…": "…"},
+  "checks": [
+    {
+      "id": "battery", "group": "Hardware", "title": "Batería", "status": "ok",
+      "detail": "Salud 88 % de la capacidad original. Ahora al 97 % (enchufada sin cargar).",
+      "fix": null,
+      "metrics": [
+        {"name": "battery_health_percent", "value": 87.9, "labels": {}},
+        {"name": "battery_charge_percent", "value": 97.0, "labels": {}},
+        {"name": "battery_plugged", "value": 1.0, "labels": {}}
+      ]
+    }
+  ]
+}
+```
+
+`GET /api/games` (recortado a un juego):
+```json
+{
+  "available": true,
+  "listed_at": 1791801971.45,
+  "sized_at": 1791801072.82,
+  "summary": {
+    "games": 31, "tools": 12, "non_steam": 41,
+    "bytes_by_drive": {"SSD": 215418227836, "microSD": 15741934141},
+    "total_bytes": 231160161977, "unplayed_6m": 22, "recoverable_bytes": 1393524275
+  },
+  "games": [
+    {
+      "appid": "1371980", "name": "No Rest for the Wicked", "drive": "SSD", "tool": false, "installed": true,
+      "last_played": 1771365921, "game_bytes": 48428628501, "proton_bytes": 362369024,
+      "shader_bytes": 124440576, "total_bytes": 48915438101
+    }
+  ],
+  "non_steam": [{"appid": "2909933050", "name": "Azahar (Emulator)"}]
+}
+```
+Las fechas son Unix (segundos) y los tamaños, bytes.
 
 ## Archivos
 | Ruta | Qué es |
