@@ -378,6 +378,76 @@ def check_uptime():
     return [result("Sistema", "Tiempo encendida", status, text, metrics=[metric("uptime_seconds", round(secs))])]
 
 
+STEAM = os.path.join(HOME, ".local/share/Steam")
+NON_STEAM_MIN = 2 ** 31  # los accesos no de Steam tienen appid con el bit alto puesto
+
+
+def steam_game_name(appid):
+    """Nombre del juego de Steam según su appmanifest, en cualquier biblioteca."""
+    libs = re.findall(r'"path"\s+"([^"]+)"', read(os.path.join(STEAM, "steamapps/libraryfolders.vdf")))
+    for lib in [STEAM] + libs:
+        name = re.search(r'"name"\s+"([^"]*)"', read(os.path.join(lib, f"steamapps/appmanifest_{appid}.acf")))
+        if name:
+            return name.group(1)
+    return None
+
+
+def shortcut_name(appid):
+    """Nombre de un acceso no de Steam en shortcuts.vdf (binario: appid int32 y luego AppName)."""
+    for path in glob.glob(os.path.join(STEAM, "userdata/*/config/shortcuts.vdf")):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(rb"\x02appid\x00(.{4})\x01appname\x00([^\x00]*)\x00", data, re.I | re.S):
+            if int.from_bytes(m.group(1), "little") == int(appid):
+                return m.group(2).decode("utf-8", "replace")
+    return None
+
+
+def session_info():
+    """Modo (game/desktop/none) y juego en marcha. Steam lanza cada juego con «reaper SteamLaunch AppId=N»."""
+    _, active = sh(["systemctl", "--user", "is-active", "gamescope-session.target"], timeout=5)
+    mode, game = ("game" if active == "active" else "none"), None
+    ticks, uptime = os.sysconf("SC_CLK_TCK"), float(read("/proc/uptime", "0").split()[0])
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        args = read(f"/proc/{pid}/cmdline").split("\0")
+        if mode == "none" and os.path.basename(args[0]) == "plasmashell":
+            mode = "desktop"
+        if os.path.basename(args[0]) != "reaper" or "SteamLaunch" not in args:
+            continue
+        appid = next((a[6:] for a in args if a.startswith("AppId=")), "")
+        try:
+            started = int(read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[19]) / ticks
+        except (IndexError, ValueError):
+            continue
+        if appid.isdigit() and (game is None or started > game["started"]):  # el más reciente
+            game = {"appid": appid, "started": started}
+    if game:
+        kind = "non_steam" if int(game["appid"]) >= NON_STEAM_MIN else "steam"
+        name = (shortcut_name if kind == "non_steam" else steam_game_name)(game["appid"])
+        if name and kind == "non_steam":
+            name = re.sub(r"\.exe$", "", name, flags=re.I)
+        secs = max(0, uptime - game["started"])
+        game = {"appid": game["appid"], "name": name or f"App {game['appid']}", "kind": kind,
+                "since": round(time.time() - secs), "seconds": round(secs)}
+    return {"mode": mode, "game": game}
+
+
+def check_session():
+    s = session_info()
+    mode = {"game": "Modo juego", "desktop": "Modo escritorio"}.get(s["mode"], "Sin sesión gráfica")
+    m = [metric("session_game_mode", s["mode"] == "game"), metric("game_running", s["game"] is not None)]
+    if not s["game"]:
+        return [result("Sistema", "Sesión", "ok", f"{mode}, sin ningún juego abierto.", metrics=m)]
+    g, mins = s["game"], s["game"]["seconds"] // 60
+    since = f"{mins // 60} h {mins % 60} min" if mins >= 60 else f"{mins} min"
+    m += [metric("game_running_seconds", g["seconds"]),
+          metric("game_playing", 1, game=g["name"], appid=g["appid"], kind=g["kind"])]
+    return [result("Sistema", "Sesión", "ok", f"{mode}, jugando a {g['name']} desde hace {since}.", metrics=m)]
+
+
 def power_setting(profile, key):
     """Valor de powerdevil (modo escritorio): primero el del usuario y si no, el de /etc/xdg."""
     for path in (os.path.join(HOME, ".config/powerdevilrc"), "/etc/xdg/powerdevilrc"):
@@ -625,7 +695,7 @@ def check_api():
 
 
 CHECKS = [check_ssh, check_password, check_path, check_keyboard, check_nsl, check_decky,
-          check_failed, check_steamos, check_uptime, check_suspend, check_battery, check_temps, check_disks,
+          check_failed, check_steamos, check_uptime, check_session, check_suspend, check_battery, check_temps, check_disks,
           check_flatpak, check_journal, check_backups, check_trash, check_shaders, check_api]
 
 

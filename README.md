@@ -64,6 +64,7 @@ Sin `git`, descarga el `.tar.gz` de la última versión en
 | Sistema | Actualización de SteamOS | `steamos-update check` | — (se instala en modo juego) |
 | Sistema | Suspensión (modo escritorio) | `AutoSuspendAction` de `[AC][SuspendAndShutdown]` en `~/.config/powerdevilrc` (o `/etc/xdg/powerdevilrc`): aviso si es distinto de 0 | No suspender enchufada (`kwriteconfig6` + `reparseConfiguration`) |
 | Sistema | Tiempo encendida | Info a partir de 7 días | — |
+| Sistema | Sesión | Modo juego o escritorio y el juego abierto, con el tiempo que lleva (siempre correcto, es informativo) | — |
 | Hardware | Batería | Salud = `charge_full / charge_full_design`: verde ≥ 80 %, amarillo ≥ 65 % | — |
 | Hardware | Temperaturas | Máximo de los `hwmon` acpitz, steamdeck_hwmon, nvme y amdgpu: amarillo ≥ 85 °C, rojo ≥ 95 °C | — |
 | Hardware | SSD interno / microSD | Libre: amarillo < 10 %, rojo < 5 %. Aviso si la microSD no está montada | Abrir DeckSpace |
@@ -102,6 +103,7 @@ Todo se lee de la propia Deck, sin servicios externos. La API ejecuta las mismas
 | Temperaturas (APU, SSD, placa, Deck) | Sensores del kernel en `/sys/class/hwmon/` |
 | Espacio libre del SSD y la microSD | `shutil.disk_usage` |
 | Tiempo encendida | `/proc/uptime` |
+| Modo juego y juego abierto | `gamescope-session.target` (modo juego) o `plasmashell` (escritorio); el juego, del proceso `reaper SteamLaunch AppId=N` que Steam pone delante de cada juego, y su nombre de `appmanifest_N.acf` o `shortcuts.vdf`. Se calcula **en cada petición**, no cada `interval` |
 | SSH (activo, contraseña, claves) | `systemctl` y `/etc/ssh/sshd_config*` |
 | Servicios fallidos | `systemctl --failed` |
 | Decky Loader y sus plugins | `~/homebrew` y el servicio `plugin_loader` |
@@ -125,16 +127,21 @@ Todo se lee de la propia Deck, sin servicios externos. La API ejecuta las mismas
 
 | Ruta | Token | Devuelve |
 |------|-------|----------|
-| `GET /api/ping` | No | `{"ok": true, "version": "1.0"}`; sirve para saber si está encendida |
-| `GET /api/health` | Sí | Todo: `host`, `checked_at`, `summary` (`status` = peor estado y `counts`), `metrics` (plano) y `checks` (id, grupo, título, estado, detalle, nombre del arreglo y métricas de cada punto) |
-| `GET /api/metrics` | Sí | Solo `checked_at`, `status` y `metrics` planas, por ejemplo `{"battery_charge_percent": 97, "temperature_celsius": {"apu": 54, …}, "disk_free_bytes": {"ssd": …, "sd": …}}` |
+| `GET /api/ping` | No | `{"ok": true, "version": "1.1"}`; sirve para saber si está encendida |
+| `GET /api/health` | Sí | Todo: `host`, `checked_at`, `summary` (`status` = peor estado y `counts`), `session` (ver abajo), `metrics` (plano) y `checks` (id, grupo, título, estado, detalle, nombre del arreglo y métricas de cada punto) |
+| `GET /api/metrics` | Sí | Solo `checked_at`, `status`, `session` y `metrics` planas, por ejemplo `{"battery_charge_percent": 97, "temperature_celsius": {"apu": 54, …}, "disk_free_bytes": {"ssd": …, "sd": …}}` |
 | `GET /metrics` | Sí | Formato Prometheus, con prefijo `deckdoctor_` |
 | `GET /api/games` | Sí | Juegos instalados (necesita [DeckSpace](https://github.com/drarekx/DeckSpace); sin ella, `{"available": false}`). Ver abajo |
 | `POST /api/refresh` | Sí | Repite todas las comprobaciones ahora, incluidas las lentas y el análisis de juegos (202) |
 
 Los `id` de las comprobaciones son estables: `ssh`, `ssh_password`, `password`, `path`, `keyboard`, `nsl`, `decky`, `failed`
-(o `failed_system`/`failed_user`), `steamos`, `uptime`, `battery`, `temps`, `disk_ssd`, `disk_sd`, `flatpak`,
+(o `failed_system`/`failed_user`), `steamos`, `uptime`, `session`, `battery`, `temps`, `disk_ssd`, `disk_sd`, `flatpak`,
 `journal`, `backups`, `trash`, `shaders` y `api`. Estados: `ok`, `info`, `warn` y `bad`.
+
+**Sesión (`session` en `/api/health` y `/api/metrics`):** `{"mode": "game"|"desktop"|"none", "game": null}` o, con
+un juego abierto, `"game": {"appid": "892970", "name": "Valheim", "kind": "steam"|"non_steam", "since": <Unix>,
+"seconds": 1520}`. Si hay varios, el abierto más tarde. Los accesos no de Steam tienen `appid` ≥ 2³¹ y el nombre sale
+de `shortcuts.vdf` (sin `.exe`).
 
 **Juegos (`/api/games`):** la API importa `deckspace.py` (de `~/Apps/DeckSpace` o de una carpeta `DeckSpace` junto a
 DeckDoctor) y reutiliza su lectura de Steam, sin duplicar código:
@@ -157,6 +164,8 @@ DeckDoctor) y reutiliza su lectura de Steam, sin duplicar código:
 - `disk_free_bytes{disk=ssd|sd}`, `disk_total_bytes{disk}` y `sd_mounted`.
 - `ssh_active`, `ssh_password_auth`, `ssh_keys`, `suspend_on_ac`, `decky_active`, `decky_plugins`, `failed_units{scope}`,
   `steamos_update_available` y `flatpak_updates`.
+- Sesión (en vivo): `session_game_mode`, `game_running`, `game_running_seconds` y, con un juego abierto,
+  `game_playing{game,appid,kind}` = 1 (en el JSON plano: `{"game_playing": {"Valheim": 1}}`).
 - `uptime_seconds`, `journal_bytes`, `backups_bytes`, `backups_oldest_days`, `trash_bytes`, `shadercache_bytes` y
   `api_active`.
 - Con DeckSpace: `games_installed{kind=steam|tool|non_steam}`, `games_bytes{drive}`, `games_unplayed_6m`,
@@ -244,7 +253,8 @@ Las fechas son Unix (segundos) y los tamaños, bytes.
 - Además, cada resultado lleva `id` (estable, para la API) y `metrics`: una lista de `metric(name, value, **labels)`.
   Si una comprobación devuelve varios resultados, cada uno lleva su `id` explícito (`disk_ssd`, `disk_sd`…).
 - API: `State` guarda los últimos resultados. Un hilo los refresca: las comprobaciones `SLOW` (SteamOS y Flatpak)
-  van aparte y con otro intervalo. `ThreadingHTTPServer` solo lee esos datos. En Prometheus las muestras se agrupan
+  van aparte y con otro intervalo; las `LIVE` (la sesión) se ejecutan en cada petición dentro de `snapshot()`.
+  `ThreadingHTTPServer` solo lee esos datos. En Prometheus las muestras se agrupan
   por familia, porque el formato exige que cada métrica vaya seguida. Las descripciones están en `METRIC_HELP`.
   Para una métrica nueva, añadir su descripción ahí.
 - Para añadir una comprobación: escribir la función y añadirla a `CHECKS`. Si es de un grupo nuevo, añadirlo a `GROUPS`.
@@ -278,6 +288,9 @@ Las fechas son Unix (segundos) y los tamaños, bytes.
   que un dashboard web pueda consultarla directamente; protege el token.
 - Los juegos se leen con el código de DeckSpace (importado como módulo opcional) en lugar de copiarlo: un único sitio
   que mantener. Por eso los campos que devuelven `installed_games()`, `shortcuts()` y `analyze()` deben mantenerse.
+- La sesión se calcula en cada petición porque cambia a menudo y es barata (un `systemctl is-active` y leer
+  `/proc`); con el intervalo de 5 minutos un dashboard mostraría un juego que ya se cerró. No hace falta Steam ni su
+  API: se lee el proceso `reaper`, así que funciona igual en modo juego y en escritorio.
 - Se exponen JSON y Prometheus a la vez: sirve tanto para un dashboard propio como para Grafana.
 
 ## Ideas pendientes

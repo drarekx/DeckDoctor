@@ -20,11 +20,12 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deckdoctor as dd  # noqa: E402
 
-VERSION = "1.0"
+VERSION = "1.1"
 CONFIG = os.path.join(dd.HOME, ".config/deckdoctor/api.json")
 DEFAULTS = {"port": 9555, "bind": "0.0.0.0", "interval": 300, "slow_interval": 21600, "games_interval": 3600,
             "token": ""}
 SLOW = {"check_steamos", "check_flatpak"}
+LIVE = {"check_session"}  # baratas y cambiantes: se calculan en cada petición
 STATUS_VALUE = {"ok": 0, "info": 1, "warn": 2, "bad": 3}
 METRIC_HELP = {
     "ssh_active": "SSH en marcha (1/0)",
@@ -52,6 +53,10 @@ METRIC_HELP = {
     "trash_bytes": "Tamaño de la papelera (bytes)",
     "shadercache_bytes": "Tamaño de la caché de shaders de Steam (bytes)",
     "api_active": "API de DeckDoctor en marcha (1/0)",
+    "session_game_mode": "Deck en modo juego (1/0)",
+    "game_running": "Hay un juego abierto (1/0)",
+    "game_running_seconds": "Segundos desde que se abrió el juego actual",
+    "game_playing": "Juego abierto ahora (siempre 1; el juego va en las etiquetas)",
     "games_installed": "Juegos instalados por tipo (steam, tool = Proton y runtimes, non_steam)",
     "games_bytes": "Lo que ocupan los juegos de Steam por unidad, con Proton y shaders si ya se midieron (bytes)",
     "games_unplayed_6m": "Juegos de Steam sin jugar en 6 meses",
@@ -137,7 +142,7 @@ class State:
 
     def refresh(self, force_slow=False):
         start = time.time()
-        fast = dd.run_all(checks=[c for c in dd.CHECKS if c.__name__ not in SLOW])
+        fast = dd.run_all(checks=[c for c in dd.CHECKS if c.__name__ not in SLOW | LIVE])
         slow = None
         if force_slow or start - self.slow_at >= self.cfg["slow_interval"]:
             slow = dd.run_all(checks=[c for c in dd.CHECKS if c.__name__ in SLOW])
@@ -163,8 +168,9 @@ class State:
                 print(f"Error al comprobar: {e}", file=sys.stderr, flush=True)
 
     def snapshot(self):
+        live = dd.run_all(checks=[c for c in dd.CHECKS if c.__name__ in LIVE])
         with self.lock:
-            return dd.sort_results(self.fast + self.slow), self.fast_at, self.slow_at, self.duration
+            return dd.sort_results(self.fast + self.slow + live), self.fast_at, self.slow_at, self.duration
 
     def games_snapshot(self):
         with self.lock:
@@ -243,7 +249,8 @@ def health_json(state):
     results, fast_at, slow_at, duration = state.snapshot()
     return {"host": socket.gethostname(), "version": VERSION,
             "checked_at": fast_at, "slow_checked_at": slow_at, "duration_seconds": round(duration, 3),
-            "summary": summary(results), "metrics": flat_metrics(results, games_metrics(state)),
+            "summary": summary(results), "session": dd.session_info(),
+            "metrics": flat_metrics(results, games_metrics(state)),
             "checks": [public(r) for r in results]}
 
 
@@ -331,7 +338,7 @@ def make_handler(state):
             if path == "/api/metrics":
                 data = health_json(state)
                 return self.send(200, {"checked_at": data["checked_at"], "status": data["summary"]["status"],
-                                       "metrics": data["metrics"]})
+                                       "session": data["session"], "metrics": data["metrics"]})
             if path == "/api/games":
                 return self.send(200, games_json(state))
             if path == "/metrics":
