@@ -1,0 +1,11 @@
+[Unit]
+Description=DeckDoctor API (estado de la Deck en JSON y Prometheus)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/Apps/DeckDoctor/deckdoctor_api.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
