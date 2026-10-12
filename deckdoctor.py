@@ -3,6 +3,7 @@
 
 import datetime as dt
 import glob
+import json
 import os
 import queue
 import re
@@ -435,17 +436,159 @@ def session_info():
     return {"mode": mode, "game": game}
 
 
+def duration(secs):
+    mins = int(secs) // 60
+    return f"{mins // 60} h {mins % 60} min" if mins >= 60 else f"{mins} min"
+
+
+# Historial de partidas: lo escribe el servicio de la API (SessionTracker), que está siempre en marcha.
+SESSIONS = os.path.join(HOME, ".config/deckdoctor/sessions.jsonl")  # una partida terminada por línea
+SESSION_CURRENT = os.path.join(HOME, ".config/deckdoctor/session_current.json")  # la partida en curso
+
+
+def load_sessions(since=0):
+    """Partidas terminadas desde `since` (Unix), de la más antigua a la más reciente."""
+    out = []
+    for line in read(SESSIONS).splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if item.get("end", 0) >= since:
+            out.append(item)
+    return out
+
+
+def current_session():
+    try:
+        with open(SESSION_CURRENT, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def played_seconds(sessions, start, end):
+    """Segundos jugados entre start y end. Una partida que cruza el límite cuenta en proporción."""
+    total = 0.0
+    for s in sessions:
+        span = max(s["end"] - s["start"], 1)
+        overlap = min(s["end"], end) - max(s["start"], start)
+        if overlap > 0:
+            total += s["seconds"] * min(overlap / span, 1)
+    return round(total)
+
+
+def play_summary(days=7):
+    """Hoy, últimos `days` días y por juego, incluida la partida en curso."""
+    now = time.time()
+    midnight = dt.datetime.combine(dt.date.today(), dt.time()).timestamp()
+    sessions = load_sessions(now - days * 86400)
+    cur = current_session()
+    if cur:
+        sessions.append({**cur, "end": cur["last"], "current": True})
+    by_game = {}
+    for s in sessions:
+        g = by_game.setdefault(s["appid"], {"appid": s["appid"], "name": s["name"], "kind": s["kind"],
+                                            "seconds": 0, "sessions": 0, "last": 0})
+        g["seconds"] += s["seconds"]
+        g["sessions"] += 1
+        g["last"] = round(max(g["last"], s["end"]))
+    return {"today_seconds": played_seconds(sessions, midnight, now + 1),
+            "period_seconds": played_seconds(sessions, now - days * 86400, now + 1), "days": days,
+            "by_game": sorted(by_game.values(), key=lambda g: -g["seconds"]), "sessions": sessions}
+
+
 def check_session():
     s = session_info()
     mode = {"game": "Modo juego", "desktop": "Modo escritorio"}.get(s["mode"], "Sin sesión gráfica")
     m = [metric("session_game_mode", s["mode"] == "game"), metric("game_running", s["game"] is not None)]
-    if not s["game"]:
-        return [result("Sistema", "Sesión", "ok", f"{mode}, sin ningún juego abierto.", metrics=m)]
-    g, mins = s["game"], s["game"]["seconds"] // 60
-    since = f"{mins // 60} h {mins % 60} min" if mins >= 60 else f"{mins} min"
-    m += [metric("game_running_seconds", g["seconds"]),
-          metric("game_playing", 1, game=g["name"], appid=g["appid"], kind=g["kind"])]
-    return [result("Sistema", "Sesión", "ok", f"{mode}, jugando a {g['name']} desde hace {since}.", metrics=m)]
+    if s["game"]:
+        g = s["game"]
+        m += [metric("game_running_seconds", g["seconds"]),
+              metric("game_playing", 1, game=g["name"], appid=g["appid"], kind=g["kind"])]
+        text = f"{mode}, jugando a {g['name']} desde hace {duration(g['seconds'])}."
+    else:
+        text = f"{mode}, sin ningún juego abierto."
+    if os.path.exists(SESSIONS) or os.path.exists(SESSION_CURRENT):
+        p = play_summary()
+        m += [metric("played_today_seconds", p["today_seconds"]), metric("played_week_seconds", p["period_seconds"])]
+        text += f" Jugado hoy: {duration(p['today_seconds'])}; últimos 7 días: {duration(p['period_seconds'])}"
+        text += f" (más: {p['by_game'][0]['name']})." if p["by_game"] else "."
+    return [result("Sistema", "Sesión", "ok", text, metrics=m)]
+
+
+def perf_info():
+    """Rendimiento en este momento. El uso de CPU se mide en 0,25 s."""
+    def num(path, scale=1):
+        try:
+            return int(read(path)) / scale
+        except ValueError:
+            return None
+
+    def cpu_times():
+        v = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:]]
+        return sum(v), v[3] + v[4]  # total, reposo (idle + iowait)
+
+    t1, i1 = cpu_times()
+    time.sleep(0.25)
+    t2, i2 = cpu_times()
+    out = {"cpu_percent": round(100 * (1 - (i2 - i1) / max(t2 - t1, 1)), 1)}
+    mem = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in read("/proc/meminfo").splitlines() if ":" in l}
+    out["ram_used_bytes"] = mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)
+    out["ram_total_bytes"] = mem.get("MemTotal", 0)
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        name = read(f"{d}/name").strip()
+        if name == "amdgpu":
+            out["apu_watts"] = num(f"{d}/power1_average", 1e6)
+            out["apu_watts_limit"] = num(f"{d}/power1_cap", 1e6)  # TDP (slowPPT)
+            out["gpu_mhz"] = num(f"{d}/freq1_input", 1e6)
+            out["gpu_percent"] = num(f"{d}/device/gpu_busy_percent")
+            out["vram_used_bytes"] = num(f"{d}/device/mem_info_vram_used")
+        elif name == "steamdeck_hwmon":
+            out["fan_rpm"] = num(f"{d}/fan1_input")
+    bat = "/sys/class/power_supply/BAT1"
+    amps, volts = num(f"{bat}/current_now", 1e6), num(f"{bat}/voltage_now", 1e6)
+    if amps is not None and volts:
+        out["battery_watts"] = round(abs(amps) * volts, 2)
+        charge = num(f"{bat}/charge_now", 1e6)
+        if read(f"{bat}/status").strip() == "Discharging" and amps and charge:
+            out["battery_minutes_left"] = round(charge / abs(amps) * 60)
+    for line in read("/proc/net/wireless").splitlines()[2:]:
+        parts = line.split()
+        out["wifi_signal_dbm"] = float(parts[3].rstrip("."))
+    out["network"] = [n for n in sorted(os.listdir("/sys/class/net")) if n != "lo"
+                      and read(f"/sys/class/net/{n}/operstate").strip() == "up"]
+    out["controllers"] = []
+    for d in glob.glob("/sys/class/power_supply/*"):
+        if read(f"{d}/scope").strip() == "Device" and num(f"{d}/capacity") is not None:
+            out["controllers"].append({"name": read(f"{d}/model_name").strip() or os.path.basename(d),
+                                       "battery_percent": num(f"{d}/capacity")})
+    return {k: (round(v, 1) if isinstance(v, float) else v) for k, v in out.items() if v is not None}
+
+
+def check_perf():
+    p = perf_info()
+    gb = 1024 ** 3
+    parts = [f"CPU {p['cpu_percent']:.0f} %", f"RAM {p['ram_used_bytes'] / gb:.1f} de {p['ram_total_bytes'] / gb:.0f} GB".replace(".", ",")]
+    if "gpu_percent" in p:
+        parts.append(f"GPU {p['gpu_percent']:.0f} % a {p.get('gpu_mhz', 0):.0f} MHz")
+    if "apu_watts" in p:
+        parts.append(f"APU {p['apu_watts']:.1f} W de {p.get('apu_watts_limit', 0):.0f} W".replace(".", ","))
+    if "fan_rpm" in p:
+        parts.append(f"ventilador {p['fan_rpm']:.0f} rpm")
+    if "battery_minutes_left" in p:
+        parts.append(f"batería {p['battery_watts']:.1f} W (quedan {duration(p['battery_minutes_left'] * 60)})")
+    if "wifi_signal_dbm" in p:
+        parts.append(f"Wi-Fi {p['wifi_signal_dbm']:.0f} dBm")
+    parts += [f"mando {c['name']} al {c['battery_percent']:.0f} %" for c in p["controllers"]]
+    m = [metric(f"perf_{k}", v) for k, v in p.items() if isinstance(v, (int, float))]
+    m += [metric("network_up", 1, interface=n) for n in p["network"]]
+    m += [metric("controller_battery_percent", c["battery_percent"], controller=c["name"]) for c in p["controllers"]]
+    low = [c["name"] for c in p["controllers"] if c["battery_percent"] <= 15]
+    text = ", ".join(parts) + "."
+    if low:
+        text += f" Carga el mando ({', '.join(low)})."
+    return [result("Hardware", "Rendimiento ahora", "warn" if low else "ok", text, metrics=m)]
 
 
 def power_setting(profile, key):
@@ -695,7 +838,8 @@ def check_api():
 
 
 CHECKS = [check_ssh, check_password, check_path, check_keyboard, check_nsl, check_decky,
-          check_failed, check_steamos, check_uptime, check_session, check_suspend, check_battery, check_temps, check_disks,
+          check_failed, check_steamos, check_uptime, check_session, check_suspend, check_battery, check_perf,
+          check_temps, check_disks,
           check_flatpak, check_journal, check_backups, check_trash, check_shaders, check_api]
 
 

@@ -20,12 +20,12 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deckdoctor as dd  # noqa: E402
 
-VERSION = "1.1"
+VERSION = "1.2"
 CONFIG = os.path.join(dd.HOME, ".config/deckdoctor/api.json")
 DEFAULTS = {"port": 9555, "bind": "0.0.0.0", "interval": 300, "slow_interval": 21600, "games_interval": 3600,
             "token": ""}
 SLOW = {"check_steamos", "check_flatpak"}
-LIVE = {"check_session"}  # baratas y cambiantes: se calculan en cada petición
+LIVE = {"check_session", "check_perf"}  # baratas y cambiantes: se calculan en cada petición
 STATUS_VALUE = {"ok": 0, "info": 1, "warn": 2, "bad": 3}
 METRIC_HELP = {
     "ssh_active": "SSH en marcha (1/0)",
@@ -53,6 +53,22 @@ METRIC_HELP = {
     "trash_bytes": "Tamaño de la papelera (bytes)",
     "shadercache_bytes": "Tamaño de la caché de shaders de Steam (bytes)",
     "api_active": "API de DeckDoctor en marcha (1/0)",
+    "played_today_seconds": "Segundos jugados hoy (historial de DeckDoctor)",
+    "played_week_seconds": "Segundos jugados en los últimos 7 días",
+    "perf_cpu_percent": "Uso de CPU (%)",
+    "perf_ram_used_bytes": "RAM en uso (bytes)",
+    "perf_ram_total_bytes": "RAM total (bytes)",
+    "perf_apu_watts": "Consumo de la APU (W)",
+    "perf_apu_watts_limit": "Límite de consumo de la APU, TDP (W)",
+    "perf_gpu_mhz": "Frecuencia de la GPU (MHz)",
+    "perf_gpu_percent": "Uso de la GPU (%)",
+    "perf_vram_used_bytes": "Memoria de vídeo en uso (bytes)",
+    "perf_fan_rpm": "Ventilador (rpm)",
+    "perf_battery_watts": "Consumo de la batería (W; 0 si está enchufada)",
+    "perf_battery_minutes_left": "Minutos de batería que quedan al ritmo actual",
+    "perf_wifi_signal_dbm": "Señal del Wi-Fi (dBm)",
+    "network_up": "Interfaz de red conectada",
+    "controller_battery_percent": "Batería de cada mando inalámbrico (%)",
     "session_game_mode": "Deck en modo juego (1/0)",
     "game_running": "Hay un juego abierto (1/0)",
     "game_running_seconds": "Segundos desde que se abrió el juego actual",
@@ -64,6 +80,8 @@ METRIC_HELP = {
     "games_sized_timestamp_seconds": "Hora del último análisis completo de tamaños (Unix)",
 }
 UNPLAYED_DAYS = 182
+SESSION_POLL = 15  # segundos entre lecturas del juego abierto
+MIN_SESSION = 30  # partidas más cortas no se guardan (juego que no llegó a arrancar)
 
 
 def load_deckspace():
@@ -176,6 +194,69 @@ class State:
         with self.lock:
             return (dict(self.games), dict(self.non_steam), self.games_at, dict(self.sized), self.recoverable,
                     self.sized_at)
+
+
+class SessionTracker:
+    """Registra cada partida en sessions.jsonl al cerrarse el juego. La partida en curso se guarda cada
+    SESSION_POLL segundos en session_current.json, para no perderla si la Deck se apaga con el juego abierto.
+    `seconds` cuenta solo el tiempo despierta: un salto mayor que 3 lecturas es una suspensión y no se suma."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.current = dd.current_session()  # de antes de reiniciar la API (o la Deck)
+
+    def save_current(self):
+        os.makedirs(os.path.dirname(dd.SESSION_CURRENT), exist_ok=True)
+        if self.current is None:
+            if os.path.exists(dd.SESSION_CURRENT):
+                os.remove(dd.SESSION_CURRENT)
+            return
+        tmp = dd.SESSION_CURRENT + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.current, f, ensure_ascii=False)
+        os.replace(tmp, dd.SESSION_CURRENT)
+
+    def finish(self):
+        cur, self.current = self.current, None
+        if cur and cur["seconds"] >= MIN_SESSION:
+            item = {k: cur[k] for k in ("appid", "name", "kind", "mode", "start")}
+            item.update(end=round(cur["last"]), seconds=round(cur["seconds"]))
+            with open(dd.SESSIONS, "a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def poll(self):
+        info, now = dd.session_info(), time.time()
+        g = info["game"]
+        with self.lock:
+            cur = self.current
+            if cur and (not g or g["appid"] != cur["appid"] or abs(g["since"] - cur["start"]) > 5):
+                self.finish()
+            if g and self.current is None:  # partida nueva (o la API arrancó con el juego ya abierto)
+                self.current = {"appid": g["appid"], "name": g["name"], "kind": g["kind"], "mode": info["mode"],
+                                "start": g["since"], "last": now, "seconds": g["seconds"]}
+            elif g:
+                gap = now - self.current["last"]
+                if gap <= 3 * SESSION_POLL:
+                    self.current["seconds"] += gap
+                self.current["last"] = now
+            self.save_current()
+
+    def loop(self):
+        while True:
+            try:
+                self.poll()
+            except Exception as e:  # noqa: BLE001
+                print(f"Error al registrar la partida: {e}", file=sys.stderr, flush=True)
+            time.sleep(SESSION_POLL)
+
+
+def sessions_json(days):
+    p = dd.play_summary(days)
+    cur = dd.current_session()
+    return {"days": days, "today_seconds": p["today_seconds"], "period_seconds": p["period_seconds"],
+            "current": cur and {k: round(v) if k in ("seconds", "last") else v for k, v in cur.items()},
+            "by_game": p["by_game"],
+            "sessions": [s for s in reversed(p["sessions"]) if not s.get("current")]}
 
 
 # ---------------------------------------------------------------- formatos de salida
@@ -341,10 +422,14 @@ def make_handler(state):
                                        "session": data["session"], "metrics": data["metrics"]})
             if path == "/api/games":
                 return self.send(200, games_json(state))
+            if path == "/api/sessions":
+                days = parse_qs(urlparse(self.path).query).get("days", ["7"])[0]
+                return self.send(200, sessions_json(min(max(int(days) if days.isdigit() else 7, 1), 3650)))
             if path == "/metrics":
                 return self.send(200, prometheus(state), "text/plain; version=0.0.4; charset=utf-8")
             self.send(404, {"error": "no existe", "routes": ["/api/ping", "/api/health", "/api/metrics",
-                                                              "/api/games", "/metrics", "POST /api/refresh"]})
+                                                              "/api/games", "/api/sessions", "/metrics",
+                                                              "POST /api/refresh"]})
 
         def do_POST(self):
             path = urlparse(self.path).path.rstrip("/")
@@ -363,6 +448,7 @@ def main():
     state = State(cfg)
     state.refresh(force_slow=True)
     threading.Thread(target=state.loop, daemon=True).start()
+    threading.Thread(target=SessionTracker().loop, daemon=True).start()
     if state.ds:
         threading.Thread(target=state.size_loop, daemon=True).start()
     server = ThreadingHTTPServer((cfg["bind"], int(cfg["port"])), make_handler(state))

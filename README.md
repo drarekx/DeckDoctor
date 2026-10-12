@@ -64,8 +64,9 @@ Sin `git`, descarga el `.tar.gz` de la última versión en
 | Sistema | Actualización de SteamOS | `steamos-update check` | — (se instala en modo juego) |
 | Sistema | Suspensión (modo escritorio) | `AutoSuspendAction` de `[AC][SuspendAndShutdown]` en `~/.config/powerdevilrc` (o `/etc/xdg/powerdevilrc`): aviso si es distinto de 0 | No suspender enchufada (`kwriteconfig6` + `reparseConfiguration`) |
 | Sistema | Tiempo encendida | Info a partir de 7 días | — |
-| Sistema | Sesión | Modo juego o escritorio y el juego abierto, con el tiempo que lleva (siempre correcto, es informativo) | — |
+| Sistema | Sesión | Modo juego o escritorio y el juego abierto, con el tiempo que lleva. Con la API activa, también lo jugado hoy y en 7 días y el juego más jugado (siempre correcto, es informativo) | — |
 | Hardware | Batería | Salud = `charge_full / charge_full_design`: verde ≥ 80 %, amarillo ≥ 65 % | — |
+| Hardware | Rendimiento ahora (`perf`) | CPU, RAM, GPU (uso y MHz), consumo de la APU frente a su límite, ventilador, gasto de batería y tiempo que queda, señal Wi-Fi y batería de los mandos inalámbricos. Aviso si un mando está al 15 % o menos | — |
 | Hardware | Temperaturas | Máximo de los `hwmon` acpitz, steamdeck_hwmon, nvme y amdgpu: amarillo ≥ 85 °C, rojo ≥ 95 °C | — |
 | Hardware | SSD interno / microSD | Libre: amarillo < 10 %, rojo < 5 %. Aviso si la microSD no está montada | Abrir DeckSpace |
 | Mantenimiento | Actualizaciones de Flatpak | `flatpak remote-ls --updates` | `flatpak update -y --noninteractive` |
@@ -103,7 +104,13 @@ Todo se lee de la propia Deck, sin servicios externos. La API ejecuta las mismas
 | Temperaturas (APU, SSD, placa, Deck) | Sensores del kernel en `/sys/class/hwmon/` |
 | Espacio libre del SSD y la microSD | `shutil.disk_usage` |
 | Tiempo encendida | `/proc/uptime` |
-| Modo juego y juego abierto | `gamescope-session.target` (modo juego) o `plasmashell` (escritorio); el juego, del proceso `reaper SteamLaunch AppId=N` que Steam pone delante de cada juego, y su nombre de `appmanifest_N.acf` o `shortcuts.vdf`. Se calcula **en cada petición**, no cada `interval` |
+| CPU y RAM | `/proc/stat` (dos lecturas separadas 0,25 s) y `/proc/meminfo` |
+| GPU, consumo y límite de la APU | `hwmon` de `amdgpu`: `power1_average`, `power1_cap` (TDP), `freq1_input`, `gpu_busy_percent`, `mem_info_vram_used` |
+| Ventilador | `hwmon` de `steamdeck_hwmon`: `fan1_input` |
+| Gasto de batería y tiempo restante | `BAT1`: `current_now` × `voltage_now` y `charge_now` / `current_now` (solo descargando) |
+| Wi-Fi, red y mandos | `/proc/net/wireless`, `/sys/class/net/*/operstate` y `power_supply` con `scope=Device` |
+| Historial de partidas | Lo escribe la propia API (ver «Partidas» más abajo) |
+| Modo juego y juego abierto | `gamescope-session.target` (modo juego) o `plasmashell` (escritorio); el juego, del proceso `reaper SteamLaunch AppId=N` que Steam pone delante de cada juego, y su nombre de `appmanifest_N.acf` o `shortcuts.vdf`. Se calcula **en cada petición**, no cada `interval` (igual que el rendimiento) |
 | SSH (activo, contraseña, claves) | `systemctl` y `/etc/ssh/sshd_config*` |
 | Servicios fallidos | `systemctl --failed` |
 | Decky Loader y sus plugins | `~/homebrew` y el servicio `plugin_loader` |
@@ -127,21 +134,33 @@ Todo se lee de la propia Deck, sin servicios externos. La API ejecuta las mismas
 
 | Ruta | Token | Devuelve |
 |------|-------|----------|
-| `GET /api/ping` | No | `{"ok": true, "version": "1.1"}`; sirve para saber si está encendida |
+| `GET /api/ping` | No | `{"ok": true, "version": "1.2"}`; sirve para saber si está encendida |
 | `GET /api/health` | Sí | Todo: `host`, `checked_at`, `summary` (`status` = peor estado y `counts`), `session` (ver abajo), `metrics` (plano) y `checks` (id, grupo, título, estado, detalle, nombre del arreglo y métricas de cada punto) |
 | `GET /api/metrics` | Sí | Solo `checked_at`, `status`, `session` y `metrics` planas, por ejemplo `{"battery_charge_percent": 97, "temperature_celsius": {"apu": 54, …}, "disk_free_bytes": {"ssd": …, "sd": …}}` |
 | `GET /metrics` | Sí | Formato Prometheus, con prefijo `deckdoctor_` |
+| `GET /api/sessions?days=7` | Sí | Historial de partidas (ver abajo). `days` de 1 a 3650 |
 | `GET /api/games` | Sí | Juegos instalados (necesita [DeckSpace](https://github.com/drarekx/DeckSpace); sin ella, `{"available": false}`). Ver abajo |
 | `POST /api/refresh` | Sí | Repite todas las comprobaciones ahora, incluidas las lentas y el análisis de juegos (202) |
 
 Los `id` de las comprobaciones son estables: `ssh`, `ssh_password`, `password`, `path`, `keyboard`, `nsl`, `decky`, `failed`
-(o `failed_system`/`failed_user`), `steamos`, `uptime`, `session`, `battery`, `temps`, `disk_ssd`, `disk_sd`, `flatpak`,
+(o `failed_system`/`failed_user`), `steamos`, `uptime`, `session`, `battery`, `perf`, `temps`, `disk_ssd`, `disk_sd`, `flatpak`,
 `journal`, `backups`, `trash`, `shaders` y `api`. Estados: `ok`, `info`, `warn` y `bad`.
 
 **Sesión (`session` en `/api/health` y `/api/metrics`):** `{"mode": "game"|"desktop"|"none", "game": null}` o, con
 un juego abierto, `"game": {"appid": "892970", "name": "Valheim", "kind": "steam"|"non_steam", "since": <Unix>,
 "seconds": 1520}`. Si hay varios, el abierto más tarde. Los accesos no de Steam tienen `appid` ≥ 2³¹ y el nombre sale
 de `shortcuts.vdf` (sin `.exe`).
+
+**Partidas (`/api/sessions`):** el servicio de la API mira cada 15 s qué juego hay abierto. Al cerrarse, añade la
+partida a `~/.config/deckdoctor/sessions.jsonl`; la partida en curso se guarda en `session_current.json`, así no se
+pierde si la Deck se apaga o se reinicia la API con el juego abierto.
+- `seconds` es tiempo **despierta**: si entre dos lecturas pasan más de 45 s, la Deck estuvo suspendida y no se suma.
+  Las partidas de menos de 30 s no se guardan (juegos que no llegaron a arrancar).
+- Solo hay historial desde que se activó la API y mientras está en marcha.
+- Respuesta: `today_seconds`, `period_seconds` (los últimos `days`), `current` (partida en curso o `null`), `by_game`
+  (`appid`, `name`, `kind`, `seconds`, `sessions`, `last`; de más a menos jugado) y `sessions` (de la más reciente a
+  la más antigua: `appid`, `name`, `kind`, `mode`, `start`, `end`, `seconds`). Una partida que cruza la medianoche
+  cuenta en cada día en proporción.
 
 **Juegos (`/api/games`):** la API importa `deckspace.py` (de `~/Apps/DeckSpace` o de una carpeta `DeckSpace` junto a
 DeckDoctor) y reutiliza su lectura de Steam, sin duplicar código:
@@ -166,6 +185,11 @@ DeckDoctor) y reutiliza su lectura de Steam, sin duplicar código:
   `steamos_update_available` y `flatpak_updates`.
 - Sesión (en vivo): `session_game_mode`, `game_running`, `game_running_seconds` y, con un juego abierto,
   `game_playing{game,appid,kind}` = 1 (en el JSON plano: `{"game_playing": {"Valheim": 1}}`).
+- Historial: `played_today_seconds` y `played_week_seconds` (incluyen la partida en curso).
+- Rendimiento (en vivo): `perf_cpu_percent`, `perf_ram_used_bytes`, `perf_ram_total_bytes`, `perf_gpu_percent`,
+  `perf_gpu_mhz`, `perf_vram_used_bytes`, `perf_apu_watts`, `perf_apu_watts_limit`, `perf_fan_rpm`,
+  `perf_battery_watts`, `perf_battery_minutes_left` (solo descargando), `perf_wifi_signal_dbm`,
+  `network_up{interface}` y `controller_battery_percent{controller}`.
 - `uptime_seconds`, `journal_bytes`, `backups_bytes`, `backups_oldest_days`, `trash_bytes`, `shadercache_bytes` y
   `api_active`.
 - Con DeckSpace: `games_installed{kind=steam|tool|non_steam}`, `games_bytes{drive}`, `games_unplayed_6m`,
@@ -243,6 +267,8 @@ Las fechas son Unix (segundos) y los tamaños, bytes.
 | `NOTAS.md` | Notas privadas de esta Deck (no se sube a GitHub) |
 | `~/.config/deckdoctor/config.json` | Preferencias opcionales: `{"keyboard": "es"}` activa la comprobación del teclado |
 | `~/.config/deckdoctor/api.json` | Configuración y token de la API |
+| `~/.config/deckdoctor/sessions.jsonl` | Historial de partidas, una por línea (lo escribe la API) |
+| `~/.config/deckdoctor/session_current.json` | Partida en curso (se borra al cerrar el juego) |
 | `~/.local/share/applications/deckdoctor.desktop` | Acceso directo del menú |
 | `~/Desktop/deckdoctor.desktop` | Copia del acceso directo en el Escritorio |
 
@@ -253,7 +279,8 @@ Las fechas son Unix (segundos) y los tamaños, bytes.
 - Además, cada resultado lleva `id` (estable, para la API) y `metrics`: una lista de `metric(name, value, **labels)`.
   Si una comprobación devuelve varios resultados, cada uno lleva su `id` explícito (`disk_ssd`, `disk_sd`…).
 - API: `State` guarda los últimos resultados. Un hilo los refresca: las comprobaciones `SLOW` (SteamOS y Flatpak)
-  van aparte y con otro intervalo; las `LIVE` (la sesión) se ejecutan en cada petición dentro de `snapshot()`.
+  van aparte y con otro intervalo; las `LIVE` (sesión y rendimiento) se ejecutan en cada petición dentro de `snapshot()`. `SessionTracker`
+  lleva el historial de partidas en otro hilo; `play_summary()` (en `deckdoctor.py`) lo resume para la ventana y la API.
   `ThreadingHTTPServer` solo lee esos datos. En Prometheus las muestras se agrupan
   por familia, porque el formato exige que cada métrica vaya seguida. Las descripciones están en `METRIC_HELP`.
   Para una métrica nueva, añadir su descripción ahí.
@@ -291,6 +318,11 @@ Las fechas son Unix (segundos) y los tamaños, bytes.
 - La sesión se calcula en cada petición porque cambia a menudo y es barata (un `systemctl is-active` y leer
   `/proc`); con el intervalo de 5 minutos un dashboard mostraría un juego que ya se cerró. No hace falta Steam ni su
   API: se lee el proceso `reaper`, así que funciona igual en modo juego y en escritorio.
+- El historial lo escribe la API y no Steam ni un servicio aparte: es lo único de DeckDoctor que está siempre en
+  marcha, y así no hace falta otro proceso. Se guarda en JSON Lines (añadir una línea es atómico y barato) en lugar de
+  leer las horas de Steam de `localconfig.vdf`, que solo dan el total y no las partidas.
+- El rendimiento no lleva FPS: los calcula `mangoapp` y no los publica en ningún sitio que se pueda leer sin depender
+  de gamescope.
 - Se exponen JSON y Prometheus a la vez: sirve tanto para un dashboard propio como para Grafana.
 
 ## Ideas pendientes
